@@ -276,10 +276,12 @@ class activation_recompute_forward(AbstractContextManager, ContextDecorator):
 
     def __exit__(self, *exc_details):
         global _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE
-        # Both globals are assigned only here and in `__enter__`, and every call site
-        # is `with`-paired, so at depth 0 the saved state is always (False, False) and
-        # this restore writes exactly what the previous unconditional reset wrote.
-        _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE = self._saved_states.pop()
+        # At depth 0 the saved state is (False, False), so this writes what the previous
+        # unconditional reset wrote. Fall back to that if the stack is empty rather than
+        # raising, since an unpaired exit used to be harmless.
+        _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE = (
+            self._saved_states.pop() if self._saved_states else (False, False)
+        )
 
 
 def is_fp8_activation_recompute_enabled() -> bool:

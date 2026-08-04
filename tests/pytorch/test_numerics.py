@@ -986,6 +986,9 @@ def test_nested_activation_recompute_contexts_restore_outer_state():
     """
     assert _recompute_globals() == (False, False)
 
+    # The phase-2 entry below also assigns `qstate.is_first_fp8_module`, which nothing
+    # here undoes; restore it so test ordering cannot affect a later FP8 test.
+    saved_is_first = FP8GlobalStateManager.quantization_state.is_first_fp8_module
     try:
         # Phase 1 nested in phase 1. Each phase-1 entry appends to the class-level
         # `_is_first_fp8_module` list, which the phase-2 entry below pops from, so this
@@ -1011,6 +1014,7 @@ def test_nested_activation_recompute_contexts_restore_outer_state():
         # `_is_first_fp8_module` is class-level state that would otherwise leak into
         # later tests.
         activation_recompute_forward._is_first_fp8_module.clear()
+        FP8GlobalStateManager.quantization_state.is_first_fp8_module = saved_is_first
 
 
 @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
