@@ -42,7 +42,9 @@ from transformer_engine.pytorch import (
     is_nvfp4_available,
 )
 from transformer_engine.pytorch import checkpoint as te_checkpoint
+from transformer_engine.pytorch import distributed as te_distributed
 from transformer_engine.pytorch.distributed import (
+    activation_recompute_forward,
     is_fp8_activation_recompute_enabled,
     in_fp8_activation_recompute_phase,
 )
@@ -953,6 +955,109 @@ def test_checkpoint_with_mixed_fp8_regions_saves_only_fp8_recompute_state(use_re
 
     assert _FP8_RECOMPUTE_KEY not in non_fp8_layer.fp8_meta
     assert _FP8_RECOMPUTE_KEY in fp8_layer.fp8_meta
+
+
+def _recompute_globals():
+    """Return the raw (region, phase) recompute globals from `te.pytorch.distributed`.
+
+    Read through the module object so the current values are observed, and deliberately
+    not through `is_fp8_activation_recompute_enabled()`: that helper ANDs the region flag
+    with `FP8GlobalStateManager.is_fp8_enabled()`, which is False outside an FP8 autocast,
+    so it would report False whether or not the region is open.
+    """
+    return (
+        te_distributed._IN_ACTIVATION_RECOMPUTE_REGION,
+        te_distributed._ACTIVATION_RECOMPUTE_PHASE,
+    )
+
+
+def test_nested_activation_recompute_contexts_restore_outer_state():
+    """Leaving an inner recompute context must restore the enclosing region and phase.
+
+    Detects: `activation_recompute_forward.__exit__` resetting the globals to False instead
+    of restoring the values saved on entry, which silently closes the enclosing region for
+    everything that runs after a nested `te.checkpoint`.
+    Fails before the fix: the assertions taken right after each inner `with` block exits see
+    (False, False) instead of the outer context's own values.
+    Passes after the fix: `__exit__` pops the state pushed by `__enter__`.
+    Cannot pass for the wrong reason: the final assertion after each outermost block requires
+    (False, False), so an "always leave the flags True" implementation fails; and the raw
+    module globals are asserted, not the FP8-gated helper, so no assertion is vacuous.
+    """
+    assert _recompute_globals() == (False, False)
+
+    try:
+        # Phase 1 nested in phase 1. Each phase-1 entry appends to the class-level
+        # `_is_first_fp8_module` list, which the phase-2 entry below pops from, so this
+        # block must run first (or the pop raises IndexError on an empty list).
+        with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
+            assert _recompute_globals() == (True, False)
+            with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
+                assert _recompute_globals() == (True, False)
+            assert _recompute_globals() == (True, False)
+        assert _recompute_globals() == (False, False)
+
+        # Phase 2 outer with a phase 1 inner. The inner context flips the phase flag, so the
+        # assertion inside it is the positive control that the inner context is genuinely
+        # entered and genuinely mutates the globals -- the restore afterwards is therefore a
+        # real restore and not a no-op.
+        with activation_recompute_forward(activation_recompute=True, recompute_phase=True):
+            assert _recompute_globals() == (True, True)
+            with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
+                assert _recompute_globals() == (True, False)
+            assert _recompute_globals() == (True, True)
+        assert _recompute_globals() == (False, False)
+    finally:
+        # `_is_first_fp8_module` is class-level state that would otherwise leak into
+        # later tests.
+        activation_recompute_forward._is_first_fp8_module.clear()
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("use_reentrant", all_boolean)
+def test_nested_checkpoint_keeps_outer_fp8_recompute_region(use_reentrant):
+    """Modules after a nested `te.checkpoint` are still inside the outer recompute region.
+
+    Detects: the same `__exit__` reset as above, but through the public API and its
+    consequence -- the module placed after the inner checkpoint stops stashing its forward
+    FP8 scales, so the recompute forward silently runs with different scales.
+    Fails before the fix: after the inner checkpoint returns, both queries report False in
+    both phases, so `observed` is [(False, False), (False, False)], and `after` never gets
+    the recompute key.
+    Passes after the fix: the inner exit restores the outer region, so the queries report
+    (True, False) in the checkpointed forward and (True, True) in the recompute.
+    Cannot pass for the wrong reason: `before` runs ahead of the inner checkpoint and is
+    unreachable by the bug, so asserting the recompute key on `before` is a positive control
+    that the whole delayed-scaling recompute machinery ran at all; if it did not, the test
+    fails rather than silently agreeing. The exact pair-list is asserted (not just
+    truthiness), so a stuck-True region flag would produce (True, True) in phase 1 and fail.
+    The assertions are on recorded flags and dict keys, never on output numerics -- an FP8
+    scale mismatch is invisible to `assert_close` because `scale_inv` is derived from the
+    same scale at cast time.
+    """
+    FP8GlobalStateManager.reset()
+    fp8_recipe = recipe.DelayedScaling(fp8_format=recipe.Format.HYBRID)
+    before = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    inner_linear = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    after = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+
+    observed = []
+
+    def body(value):
+        with autocast(enabled=True, recipe=fp8_recipe):
+            value = before(value)
+            value = te_checkpoint(inner_linear, value, use_reentrant=use_reentrant)
+            observed.append(
+                (is_fp8_activation_recompute_enabled(), in_fp8_activation_recompute_phase())
+            )
+            return after(value)
+
+    _checkpointed_linear_backward(body, use_reentrant, before, inner_linear, after)
+
+    # One entry for the checkpointed forward, one for the recompute during backward.
+    assert observed == [(True, False), (True, True)]
+    assert _FP8_RECOMPUTE_KEY in before.fp8_meta
+    assert _FP8_RECOMPUTE_KEY in after.fp8_meta
 
 
 def _test_e2e_checkpointing_get_model(config, dtype):
