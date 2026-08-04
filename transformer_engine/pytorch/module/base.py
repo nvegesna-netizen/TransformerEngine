@@ -1570,8 +1570,10 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         # Activation recomputation is used and this is the second forward phase.
         if self.fp8 and in_fp8_activation_recompute_phase():
-            delayed_scaling_recipe = _has_delayed_scaling_state(self.fp8_meta)
-            FP8GlobalStateManager.get_old_fp8_meta_tensors_for_recompute(self.fp8_meta)
+            # Mirror the stash gate below (#63 leak guard). Gate the call, not the
+            # branch, so eval phase-2 forwards do not redo phase-1 setup.
+            if self.training:
+                FP8GlobalStateManager.get_old_fp8_meta_tensors_for_recompute(self.fp8_meta)
         else:
             if not inp.is_cuda:
                 raise RuntimeError(
@@ -1617,7 +1619,14 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         DelayedScaling metadata handling and the NVTX ranges.
         """
         delayed_scaling_recipe = self.fp8 and _has_delayed_scaling_state(self.fp8_meta)
-        if delayed_scaling_recipe and self.fp8 and in_fp8_activation_recompute_phase():
+        # Mirrors the stash gate; without it this reinstalls stale `updated_*_fwd`
+        # values left over from an earlier training iteration.
+        if (
+            delayed_scaling_recipe
+            and self.fp8
+            and self.training
+            and in_fp8_activation_recompute_phase()
+        ):
             FP8GlobalStateManager.restore_fp8_meta_tensors(self.fp8_meta)
         nvtx_range_pop()
 

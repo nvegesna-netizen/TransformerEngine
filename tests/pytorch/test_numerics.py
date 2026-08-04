@@ -1060,6 +1060,52 @@ def test_nested_checkpoint_keeps_outer_fp8_recompute_region(use_reentrant):
     assert _FP8_RECOMPUTE_KEY in after.fp8_meta
 
 
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("use_reentrant", all_boolean)
+@pytest.mark.parametrize("training", all_boolean)
+def test_checkpoint_with_eval_module_skips_fp8_recompute_state(training, use_reentrant):
+    """The stash and the two restore sites must agree on the `self.training` gate.
+
+    Detects: the stash in `prepare_forward` being gated on `self.training` while the restores
+    in `prepare_forward` and `end_forward` are not.
+    Fails before the fix (training=False): nothing was stashed in phase 1, but the recompute
+    forward still restores, so `get_old_fp8_meta_tensors_for_recompute` raises KeyError on the
+    missing buffer-position key (or IndexError once a deque has been drained). The test errors
+    out; it is deliberately not written as `pytest.raises`, which would have to be deleted the
+    moment the fix lands.
+    Passes after the fix: an `.eval()` module neither stashes nor restores and the checkpoint
+    completes.
+    Cannot pass for the wrong reason: `training=True` is the positive control. It exercises
+    the identical code path and asserts the recompute key IS written and a recompute deque IS
+    created, so if the checkpoint stopped being an FP8 delayed-scaling recompute region (bad
+    recipe, FP8 disabled, checkpoint bypassed) that parametrization fails and the eval case
+    can no longer pass for free. The eval case additionally asserts that no deque is created,
+    so the memory guard that keeps eval modules out of the recompute buffer is covered too.
+    """
+    FP8GlobalStateManager.reset()
+    fp8_recipe = recipe.DelayedScaling(fp8_format=recipe.Format.HYBRID)
+    layer = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    layer.train(training)
+    assert layer.training == training
+
+    def body(value):
+        with autocast(enabled=True, recipe=fp8_recipe):
+            return layer(value)
+
+    # Must not raise in either mode.
+    _checkpointed_linear_backward(body, use_reentrant, layer)
+
+    assert (_FP8_RECOMPUTE_KEY in layer.fp8_meta) == training
+
+    recompute_buffer = FP8GlobalStateManager.quantization_state.fp8_tensors_recompute_buffer
+    if training:
+        assert len(recompute_buffer) == 1
+        # The single stashed entry is consumed by the recompute forward.
+        assert all(len(stashed) == 0 for stashed in recompute_buffer)
+    else:
+        assert len(recompute_buffer) == 0
+
+
 def _test_e2e_checkpointing_get_model(config, dtype):
     sigma = 0.023
     init_method = init_method_normal(sigma)
