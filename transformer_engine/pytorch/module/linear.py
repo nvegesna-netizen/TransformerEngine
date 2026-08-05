@@ -261,12 +261,11 @@ def _check_fp8_reduce_and_update():
     qstate = FP8GlobalStateManager.quantization_state
     _first_fp8_module = qstate.is_first_fp8_module
     result = FP8GlobalStateManager.is_first_fp8_module()
-    if in_fp8_activation_recompute_phase():
+    # A replayed nested forward consumes the election like any other forward. Under an outer
+    # reentrant checkpoint its context is the only one that is ever backwarded, so restoring
+    # here would leave no module owning the backward reduce at all.
+    if in_fp8_activation_recompute_phase() and not in_reentered_recompute_forward():
         qstate.is_first_fp8_module = _first_fp8_module
-    if in_reentered_recompute_forward():
-        # A replayed nested forward is not the real forward. Letting its context own the
-        # backward reduce makes every module in the region claim it.
-        return False
     return result
 
 
