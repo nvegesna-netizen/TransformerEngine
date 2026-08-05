@@ -43,6 +43,7 @@ from ..distributed import (
     gather_along_first_dim,
     is_fp8_activation_recompute_enabled,
     in_fp8_activation_recompute_phase,
+    in_reentered_recompute_forward,
     _fsdp_gather_tensors,
 )
 from ..constants import dist_group_type
@@ -1610,8 +1611,13 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             # Restore only what this module stashed. `self.training` is re-read here in a
             # different autograd phase than the stash, so the two can disagree; the count cannot.
             if self.fp8_recompute_stashes > 0:
-                FP8GlobalStateManager.get_old_fp8_meta_tensors_for_recompute(self.fp8_meta)
-                self.fast_setattr("fp8_recompute_stashes", self.fp8_recompute_stashes - 1)
+                if in_reentered_recompute_forward():
+                    # Replayed nested forward: read the stash but leave it in place, since
+                    # this region's own recompute is what pairs with the stash.
+                    FP8GlobalStateManager.peek_fp8_meta_tensors_for_recompute(self.fp8_meta)
+                else:
+                    FP8GlobalStateManager.get_old_fp8_meta_tensors_for_recompute(self.fp8_meta)
+                    self.fast_setattr("fp8_recompute_stashes", self.fp8_recompute_stashes - 1)
                 restored = True
         else:
             if not inp.is_cuda:

@@ -810,6 +810,24 @@ class FP8GlobalStateManager:
             fp8_meta[buffer_position_key] = len(qstate.fp8_tensors_recompute_buffer) - 1
 
     @classmethod
+    def _swap_in_stashed_fp8_meta(cls, fp8_meta: Dict[str, Any], consume: bool) -> None:
+        """Swap in the phase 1 scales and amaxes, optionally consuming the stash."""
+        # Store updated amaxes and scales from phase 1 post forward.
+        fp8_meta["updated_amax_history_fwd"] = fp8_meta["scaling_fwd"].amax_history.clone()
+        fp8_meta["updated_scale_fwd"] = fp8_meta["scaling_fwd"].scale.clone()
+
+        # Retrieve stashed amaxes and scales from phase 1 pre forward.
+        buffer_position_key = "global_fp8_buffer_pos_fwd_recompute"
+        buffer = cls.quantization_state.fp8_tensors_recompute_buffer[fp8_meta[buffer_position_key]]
+        # Read in place when not consuming: popping and re-appending would reorder this
+        # module's other in-flight forwards.
+        stashed_fp8_meta = buffer.popleft() if consume else buffer[0]
+
+        # Replace amaxes and scales with stashed values for phase 2 forward
+        fp8_meta["scaling_fwd"].amax_history.copy_(stashed_fp8_meta[0])
+        fp8_meta["scaling_fwd"].scale.copy_(stashed_fp8_meta[1])
+
+    @classmethod
     def get_old_fp8_meta_tensors_for_recompute(cls, fp8_meta: Dict[str, Any]) -> None:
         """Switch to the copied scaling factors and amaxes from phase
         1 forward for indentical numerical outputs.
@@ -818,19 +836,21 @@ class FP8GlobalStateManager:
         if not _has_delayed_scaling_state(fp8_meta):
             return
 
-        # Store updated amaxes and scales from phase 1 post forward.
-        fp8_meta["updated_amax_history_fwd"] = fp8_meta["scaling_fwd"].amax_history.clone()
-        fp8_meta["updated_scale_fwd"] = fp8_meta["scaling_fwd"].scale.clone()
+        cls._swap_in_stashed_fp8_meta(fp8_meta, consume=True)
 
-        # Retrieve stashed amaxes and scales from phase 1 pre forward.
-        buffer_position_key = "global_fp8_buffer_pos_fwd_recompute"
-        stashed_fp8_meta = cls.quantization_state.fp8_tensors_recompute_buffer[
-            fp8_meta[buffer_position_key]
-        ].popleft()
+    @classmethod
+    def peek_fp8_meta_tensors_for_recompute(cls, fp8_meta: Dict[str, Any]) -> None:
+        """Switch to the phase 1 scaling factors and amaxes without consuming the stash.
 
-        # Replace amaxes and scales with stashed values for phase 2 forward
-        fp8_meta["scaling_fwd"].amax_history.copy_(stashed_fp8_meta[0])
-        fp8_meta["scaling_fwd"].scale.copy_(stashed_fp8_meta[1])
+        Used when a nested checkpoint's forward is replayed inside the enclosing recompute:
+        it needs the phase 1 values, but this region's own recompute is the call that pairs
+        with the stash.
+        """
+        # delayed scaling only function, noop for any other recipe
+        if not _has_delayed_scaling_state(fp8_meta):
+            return
+
+        cls._swap_in_stashed_fp8_meta(fp8_meta, consume=False)
 
     @staticmethod
     def restore_fp8_meta_tensors(fp8_meta: Dict[str, Any]) -> None:

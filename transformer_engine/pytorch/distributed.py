@@ -64,6 +64,7 @@ _USE_REENTRANT_ACTIVATION_RECOMPUTE = True
 
 _IN_ACTIVATION_RECOMPUTE_REGION = False
 _ACTIVATION_RECOMPUTE_PHASE = False
+_ACTIVATION_RECOMPUTE_REENTERED_FORWARD = False
 
 
 _ALL_ACTIVE_RNG_STATES = {}
@@ -254,34 +255,56 @@ class activation_recompute_forward(AbstractContextManager, ContextDecorator):
         self.activation_recompute = activation_recompute
         self.recompute_phase = recompute_phase
         # Stack, not a scalar: this is a ContextDecorator and instances are reused.
-        self._saved_states: List[Tuple[bool, bool]] = []
+        self._saved_states: List[Tuple[bool, bool, bool]] = []
 
     def __enter__(self):
         global _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE
+        global _ACTIVATION_RECOMPUTE_REENTERED_FORWARD
+        # A nested checkpoint re-runs its own forward inside the enclosing recompute. That is
+        # not a new phase-1 forward: inheriting the phase keeps it on the phase-1 scales and
+        # stops it stashing a second copy that nothing ever pops.
+        enclosing_phase = _ACTIVATION_RECOMPUTE_PHASE
+        reentered = self.activation_recompute and not self.recompute_phase and enclosing_phase
+
+        qstate = FP8GlobalStateManager.quantization_state
+        # Done before the globals are touched: `pop` can raise on an unbalanced history, and
+        # `__exit__` does not run when `__enter__` raises, so a mutation here would stick.
+        # A re-entered forward is replayed by the enclosing recompute, which already popped for
+        # it. Pushing here would leave an entry that nothing pops.
+        if self.activation_recompute and not self.recompute_phase and not reentered:
+            activation_recompute_forward._is_first_fp8_module.append(qstate.is_first_fp8_module)
+        if self.activation_recompute and self.recompute_phase:
+            qstate.is_first_fp8_module = activation_recompute_forward._is_first_fp8_module.pop(0)
+
         # Save the enclosing state so an inner region does not end the outer one.
-        self._saved_states.append((_IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE))
+        self._saved_states.append(
+            (
+                _IN_ACTIVATION_RECOMPUTE_REGION,
+                _ACTIVATION_RECOMPUTE_PHASE,
+                _ACTIVATION_RECOMPUTE_REENTERED_FORWARD,
+            )
+        )
         # Track the checkpoint region independently of the FP8 state at entry.
         # A checkpointed callable may open its own FP8 autocast context (for
         # example, to select precision per layer). Delayed-scaling modules in
         # that inner context must still save their scale and amax metadata for
         # the recompute forward.
         _IN_ACTIVATION_RECOMPUTE_REGION = self.activation_recompute
-        _ACTIVATION_RECOMPUTE_PHASE = self.recompute_phase
-
-        qstate = FP8GlobalStateManager.quantization_state
-        if self.activation_recompute and not self.recompute_phase:
-            activation_recompute_forward._is_first_fp8_module.append(qstate.is_first_fp8_module)
-        if self.activation_recompute and self.recompute_phase:
-            qstate.is_first_fp8_module = activation_recompute_forward._is_first_fp8_module.pop(0)
+        _ACTIVATION_RECOMPUTE_PHASE = self.recompute_phase or enclosing_phase
+        _ACTIVATION_RECOMPUTE_REENTERED_FORWARD = reentered
 
     def __exit__(self, *exc_details):
         global _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE
-        # At depth 0 the saved state is (False, False), so this writes what the previous
+        global _ACTIVATION_RECOMPUTE_REENTERED_FORWARD
+        # At depth 0 the saved state is all False, so this writes what the previous
         # unconditional reset wrote. Fall back to that if the stack is empty rather than
         # raising, since an unpaired exit used to be harmless.
-        _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE = (
-            self._saved_states.pop() if self._saved_states else (False, False)
-        )
+        saved = self._saved_states.pop() if self._saved_states else (False, False, False)
+        (
+            _IN_ACTIVATION_RECOMPUTE_REGION,
+            _ACTIVATION_RECOMPUTE_PHASE,
+            _ACTIVATION_RECOMPUTE_REENTERED_FORWARD,
+        ) = saved
 
 
 def is_fp8_activation_recompute_enabled() -> bool:
@@ -292,6 +315,15 @@ def is_fp8_activation_recompute_enabled() -> bool:
 def in_fp8_activation_recompute_phase() -> bool:
     """Return global boolean"""
     return _ACTIVATION_RECOMPUTE_PHASE
+
+
+def in_reentered_recompute_forward() -> bool:
+    """Whether a nested checkpoint's own forward is re-running inside the enclosing recompute.
+
+    Such a forward needs the stashed FP8 state but must not consume it, since this region's
+    own recompute is what pairs with the stash.
+    """
+    return _ACTIVATION_RECOMPUTE_REENTERED_FORWARD
 
 
 def _get_active_autocast_contexts():

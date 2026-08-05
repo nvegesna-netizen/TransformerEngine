@@ -958,58 +958,80 @@ def test_checkpoint_with_mixed_fp8_regions_saves_only_fp8_recompute_state(use_re
 
 
 def _recompute_globals():
-    """Return the raw (region, phase) recompute globals from `te.pytorch.distributed`.
+    """Return the raw (region, phase, reentered) recompute globals from `te.pytorch.distributed`.
 
     Read through the module object so the current values are observed, and deliberately
     not through `is_fp8_activation_recompute_enabled()`: that helper ANDs the region flag
     with `FP8GlobalStateManager.is_fp8_enabled()`, which is False outside an FP8 autocast,
     so it would report False whether or not the region is open.
+
+    `getattr` for the third element so that deleting the re-entered-forward handling makes
+    these tests fail on an assertion rather than at import time.
     """
     return (
         te_distributed._IN_ACTIVATION_RECOMPUTE_REGION,
         te_distributed._ACTIVATION_RECOMPUTE_PHASE,
+        getattr(te_distributed, "_ACTIVATION_RECOMPUTE_REENTERED_FORWARD", False),
     )
 
 
 def test_nested_activation_recompute_contexts_restore_outer_state():
-    """Leaving an inner recompute context must restore the enclosing region and phase.
+    """Leaving an inner recompute context must restore the enclosing region, phase and flag.
 
     Detects: `activation_recompute_forward.__exit__` resetting the globals to False instead
-    of restoring the values saved on entry, which silently closes the enclosing region for
-    everything that runs after a nested `te.checkpoint`.
-    Fails before the fix: the assertions taken right after each inner `with` block exits see
-    (False, False) instead of the outer context's own values.
-    Passes after the fix: `__exit__` pops the state pushed by `__enter__`.
-    Cannot pass for the wrong reason: the final assertion after each outermost block requires
-    (False, False), so an "always leave the flags True" implementation fails; and the raw
-    module globals are asserted, not the FP8-gated helper, so no assertion is vacuous.
+    of restoring the values saved on entry, and `__enter__` clearing an enclosing recompute
+    phase instead of inheriting it. A nested checkpoint's own forward re-runs inside the
+    enclosing recompute; treating it as a fresh phase-1 forward makes it stash a second copy
+    of the FP8 scales that nothing ever pops.
+    Fails before the fix: the assertions after each inner `with` block see (False, False)
+    instead of the outer values, and the phase-1-inside-phase-2 block reports phase False
+    with no re-entered flag at all.
+    Passes after the fix: `__exit__` pops the state pushed by `__enter__`, and a phase-1
+    entry made inside an active recompute phase inherits that phase and is flagged
+    re-entered.
+    Cannot pass for the wrong reason: the phase-1-in-phase-1 block is the positive control --
+    it is genuinely entered, genuinely mutates the globals, is asserted NOT to be re-entered
+    and IS asserted to push onto `_is_first_fp8_module`, so an "always inherit" or "always
+    mark re-entered" implementation fails there. The final assertion after each outermost
+    block requires all-False, so an "always leave the flags True" implementation fails. The
+    raw module globals are asserted, not the FP8-gated helper, so no assertion is vacuous.
     """
-    assert _recompute_globals() == (False, False)
+    assert _recompute_globals() == (False, False, False)
 
     # The phase-2 entry below also assigns `qstate.is_first_fp8_module`, which nothing
     # here undoes; restore it so test ordering cannot affect a later FP8 test.
     saved_is_first = FP8GlobalStateManager.quantization_state.is_first_fp8_module
+    activation_recompute_forward._is_first_fp8_module.clear()
     try:
-        # Phase 1 nested in phase 1. Each phase-1 entry appends to the class-level
-        # `_is_first_fp8_module` list, which the phase-2 entry below pops from, so this
-        # block must run first (or the pop raises IndexError on an empty list).
+        # Phase 1 nested in phase 1. No enclosing recompute phase, so nothing is re-entered
+        # and both levels push onto the `_is_first_fp8_module` election stack, which the
+        # phase-2 entries below pop from.
         with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
-            assert _recompute_globals() == (True, False)
+            assert _recompute_globals() == (True, False, False)
+            assert len(activation_recompute_forward._is_first_fp8_module) == 1
             with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
-                assert _recompute_globals() == (True, False)
-            assert _recompute_globals() == (True, False)
-        assert _recompute_globals() == (False, False)
+                assert _recompute_globals() == (True, False, False)
+                assert len(activation_recompute_forward._is_first_fp8_module) == 2
+            assert _recompute_globals() == (True, False, False)
+        assert _recompute_globals() == (False, False, False)
+        assert len(activation_recompute_forward._is_first_fp8_module) == 2
 
-        # Phase 2 outer with a phase 1 inner. The inner context flips the phase flag, so the
-        # assertion inside it is the positive control that the inner context is genuinely
-        # entered and genuinely mutates the globals -- the restore afterwards is therefore a
-        # real restore and not a no-op.
+        # Phase 2 outer with a phase 1 inner: the replayed nested forward. It inherits the
+        # enclosing phase, is flagged re-entered, and must NOT push -- the enclosing
+        # recompute already popped on its behalf.
         with activation_recompute_forward(activation_recompute=True, recompute_phase=True):
-            assert _recompute_globals() == (True, True)
+            assert _recompute_globals() == (True, True, False)
+            assert len(activation_recompute_forward._is_first_fp8_module) == 1
             with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
-                assert _recompute_globals() == (True, False)
-            assert _recompute_globals() == (True, True)
-        assert _recompute_globals() == (False, False)
+                assert _recompute_globals() == (True, True, True)
+                assert len(activation_recompute_forward._is_first_fp8_module) == 1
+                # Depth 3: still inside the same enclosing recompute, still re-entered.
+                with activation_recompute_forward(activation_recompute=True, recompute_phase=False):
+                    assert _recompute_globals() == (True, True, True)
+                    assert len(activation_recompute_forward._is_first_fp8_module) == 1
+                assert _recompute_globals() == (True, True, True)
+            assert _recompute_globals() == (True, True, False)
+        assert _recompute_globals() == (False, False, False)
     finally:
         # `_is_first_fp8_module` is class-level state that would otherwise leak into
         # later tests.
