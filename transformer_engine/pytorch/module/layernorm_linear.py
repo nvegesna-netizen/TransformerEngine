@@ -53,6 +53,7 @@ from ..distributed import (
     reduce_scatter_along_first_dim,
     gather_along_first_dim,
     in_fp8_activation_recompute_phase,
+    in_reentered_recompute_forward,
     _fsdp_scatter_tensors,
     _fsdp_gather_tensors,
 )
@@ -595,6 +596,10 @@ class _LayerNormLinear(torch.autograd.Function):
                 ctx.reduce_and_update_bwd_fp8_tensors = FP8GlobalStateManager.is_first_fp8_module()
                 if in_fp8_activation_recompute_phase():
                     qstate.is_first_fp8_module = _first_fp8_module
+                if in_reentered_recompute_forward():
+                    # A replayed nested forward is not the real forward. Letting its context
+                    # own the backward reduce makes every module in the region claim it.
+                    ctx.reduce_and_update_bwd_fp8_tensors = False
             ctx.wgrad_store = wgrad_store
             ctx.debug = debug
 

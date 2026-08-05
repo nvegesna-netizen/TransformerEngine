@@ -58,6 +58,7 @@ from ..distributed import (
     gather_along_first_dim,
     is_fp8_activation_recompute_enabled,
     in_fp8_activation_recompute_phase,
+    in_reentered_recompute_forward,
     _fsdp_scatter_tensors,
     _fsdp_gather_tensors,
 )
@@ -262,6 +263,10 @@ def _check_fp8_reduce_and_update():
     result = FP8GlobalStateManager.is_first_fp8_module()
     if in_fp8_activation_recompute_phase():
         qstate.is_first_fp8_module = _first_fp8_module
+    if in_reentered_recompute_forward():
+        # A replayed nested forward is not the real forward. Letting its context own the
+        # backward reduce makes every module in the region claim it.
+        return False
     return result
 
 
