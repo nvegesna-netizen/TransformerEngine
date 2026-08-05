@@ -916,12 +916,13 @@ class _LayerNormMLP(torch.autograd.Function):
                 qstate = FP8GlobalStateManager.quantization_state
                 _first_fp8_module = qstate.is_first_fp8_module
                 ctx.reduce_and_update_bwd_fp8_tensors = FP8GlobalStateManager.is_first_fp8_module()
-                if in_fp8_activation_recompute_phase() or is_recomputation:
+                # See `_check_fp8_reduce_and_update` in linear.py: a replayed nested forward
+                # consumes the election rather than restoring it. `is_recomputation` is this
+                # module's own selective recompute, a separate mechanism, and is left alone.
+                if (
+                    in_fp8_activation_recompute_phase() and not in_reentered_recompute_forward()
+                ) or is_recomputation:
                     qstate.is_first_fp8_module = _first_fp8_module
-                if in_reentered_recompute_forward():
-                    # A replayed nested forward is not the real forward. Letting its context
-                    # own the backward reduce makes every module in the region claim it.
-                    ctx.reduce_and_update_bwd_fp8_tensors = False
 
             ctx.wgrad_store = wgrad_store
             if is_recomputation:  # return the recomputed tensors
