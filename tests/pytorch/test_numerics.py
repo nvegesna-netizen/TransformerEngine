@@ -1110,6 +1110,154 @@ def test_checkpoint_with_eval_module_skips_fp8_recompute_state(training, use_ree
         assert len(recompute_buffer) == 0
 
 
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("use_reentrant", all_boolean)
+@pytest.mark.parametrize("switch_to_eval", all_boolean)
+def test_checkpoint_mode_change_between_phases_does_not_leak_recompute_stash(
+    switch_to_eval, use_reentrant
+):
+    """A module switched to `.eval()` after the forward must still drain its recompute stash.
+
+    Detects: the stash decision (taken in the forward) and the restore decision (taken in the
+    recompute forward, which runs inside `backward()`) being derived independently from
+    `self.training`. Training at the forward and eval at the backward stashes without ever
+    popping, so the deque grows one entry per iteration and later pops return a stale scale.
+    Fails before the fix (switch_to_eval=True): `stash_lengths` is [1, 2, 3] rather than
+    [0, 0, 0], because the phase-2 gate reads `self.training == False` and skips the pop.
+    Passes after the fix: the pop is driven by what the forward recorded, not by the mode
+    observed during the backward pass.
+    Cannot pass for the wrong reason: `switch_to_eval=False` is the in-test control, running
+    identical code with the mode held constant, so "no FP8 state was ever created" does not
+    satisfy the assertion for free. The test also asserts the recompute key IS written and
+    exactly one deque IS allocated, and pins the exact per-call (region, phase, training)
+    triples, which proves the recompute forward really ran during backward and saw the mode
+    intended. Nothing is asserted on output numerics: a wrong FP8 scale is invisible to
+    `assert_close` because `scale_inv` is derived from the same scale at cast time.
+    """
+    FP8GlobalStateManager.reset()
+    fp8_recipe = recipe.DelayedScaling(fp8_format=recipe.Format.HYBRID)
+    layer = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+
+    observed = []
+
+    def body(value):
+        with autocast(enabled=True, recipe=fp8_recipe):
+            observed.append(
+                (
+                    is_fp8_activation_recompute_enabled(),
+                    in_fp8_activation_recompute_phase(),
+                    layer.training,
+                )
+            )
+            return layer(value)
+
+    num_iters = 3
+    stash_lengths = []
+    for i in range(num_iters):
+        layer.train()
+        # Grow the input so the delayed scaling factor genuinely moves between iterations.
+        inp = (torch.randn(16, 16, device="cuda", dtype=torch.bfloat16) * (2.0**i)).requires_grad_()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = te_checkpoint(body, inp, use_reentrant=use_reentrant)
+            loss = out.float().sum()
+
+        # The point of the test: the mode changes between the two phases.
+        if switch_to_eval:
+            layer.eval()
+        loss.backward()
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(loss)
+        assert inp.grad is not None and torch.isfinite(inp.grad).all()
+        assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+
+        # Positive control: the forward ran in training mode, so a stash must exist.
+        assert _FP8_RECOMPUTE_KEY in layer.fp8_meta, "No forward scale was stashed at all"
+        recompute_buffer = FP8GlobalStateManager.quantization_state.fp8_tensors_recompute_buffer
+        assert len(recompute_buffer) == 1
+        stash_lengths.append(len(recompute_buffer[layer.fp8_meta[_FP8_RECOMPUTE_KEY]]))
+
+        # If the recompute took the stashed scales, `end_forward` must have put the live ones
+        # back, otherwise the next iteration starts from a phase-1 scale.
+        # Unconditional: if the restore ever stopped running, a `.get()` guarded check
+        # would evaporate silently instead of failing.
+        assert "updated_scale_fwd" in layer.fp8_meta
+        assert torch.equal(layer.fp8_meta["scaling_fwd"].scale, layer.fp8_meta["updated_scale_fwd"])
+
+        assert observed[-2:] == [
+            (True, False, True),
+            (True, True, not switch_to_eval),
+        ]
+
+    assert stash_lengths == [0] * num_iters, f"Recompute stash leaked: {stash_lengths}"
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("use_reentrant", all_boolean)
+def test_checkpoint_eval_forward_train_backward_does_not_restore(use_reentrant):
+    """A module in `.eval()` at the forward must not be restored when training at backward.
+
+    Detects: the mirror image of the leak, a pop with no matching stash. The eval forward
+    skips the stash, so the buffer position is never written; if the module is back in
+    training mode when the recompute forward runs, the restore looks that key up anyway.
+    Fails before the fix: `KeyError: 'global_fp8_buffer_pos_fwd_recompute'` out of
+    `loss.backward()`. Deliberately not written as `pytest.raises`, which would have to be
+    deleted the moment the fix lands.
+    Passes after the fix: the restore follows the decision recorded at stash time, so a module
+    that never stashed is never restored.
+    Cannot pass for the wrong reason: `control` stays in training mode across both phases in
+    the same checkpointed callable and is asserted to stash and to have its deque drained, so
+    a green result cannot mean "FP8 was off" or "the checkpoint fell back to the native one".
+    The exact tuples also pin that the recompute ran with `toggled` back in training mode,
+    which is the condition that triggers the bug.
+    """
+    FP8GlobalStateManager.reset()
+    fp8_recipe = recipe.DelayedScaling(fp8_format=recipe.Format.HYBRID)
+    control = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    toggled = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    toggled.eval()
+
+    observed = []
+
+    def body(value):
+        with autocast(enabled=True, recipe=fp8_recipe):
+            observed.append(
+                (
+                    is_fp8_activation_recompute_enabled(),
+                    in_fp8_activation_recompute_phase(),
+                    control.training,
+                    toggled.training,
+                )
+            )
+            return toggled(control(value))
+
+    inp = torch.randn(16, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = te_checkpoint(body, inp, use_reentrant=use_reentrant)
+        loss = out.float().sum()
+
+    # `toggled` was in eval for the forward and is in training for the recompute.
+    toggled.train()
+    loss.backward()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(loss)
+    assert inp.grad is not None and torch.isfinite(inp.grad).all()
+    for layer in (control, toggled):
+        assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+
+    assert observed == [(True, False, True, False), (True, True, True, True)]
+
+    recompute_buffer = FP8GlobalStateManager.quantization_state.fp8_tensors_recompute_buffer
+    # Positive control: the always-training module stashed and its stash was consumed.
+    assert _FP8_RECOMPUTE_KEY in control.fp8_meta
+    assert len(recompute_buffer) == 1
+    assert len(recompute_buffer[control.fp8_meta[_FP8_RECOMPUTE_KEY]]) == 0
+    # The eval-at-forward module neither stashed nor restored, at either restore site.
+    assert _FP8_RECOMPUTE_KEY not in toggled.fp8_meta
+    assert "updated_scale_fwd" not in toggled.fp8_meta
+
+
 def _test_e2e_checkpointing_get_model(config, dtype):
     sigma = 0.023
     init_method = init_method_normal(sigma)
