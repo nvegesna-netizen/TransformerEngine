@@ -27,6 +27,7 @@ from transformer_engine.pytorch import (
     LayerNormLinear,
     LayerNormMLP,
     Linear,
+    GroupedLinear,
     MultiheadAttention,
     RMSNorm,
     TransformerLayer,
@@ -42,6 +43,7 @@ from transformer_engine.pytorch import (
     is_nvfp4_available,
 )
 from transformer_engine.pytorch import checkpoint as te_checkpoint
+from transformer_engine.pytorch.distributed import in_fp8_activation_recompute_phase
 from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.common import recipe
 from transformer_engine.pytorch import DType
@@ -2245,3 +2247,332 @@ def test_noncontiguous():
     out = _run_module(g2, b)
 
     assert_allclose(out, outT, 1e-7)
+
+
+# ----------------------------------------------------------------------------
+# Backward FP8 amax-reduce election under activation recompute.
+#
+# `FP8GlobalStateManager.is_first_fp8_module()` is a one-shot read-and-clear
+# electing the single module that issues the backward amax all-reduce. A
+# recompute region opens its own depth-0 autocast, which arms the flag on entry,
+# so the election is already scoped to the region; restoring the flag after
+# reading it made the read non-consuming and every module in the region claimed.
+#
+# All of these use DelayedScaling exclusively. `reduce_and_update_fp8_tensors`
+# early-returns for every other recipe (the global amax buffer is empty), so
+# under any other recipe every count below would be 0 and the assertions would
+# pass vacuously.
+# ----------------------------------------------------------------------------
+
+_ELECT_HIDDEN = 128
+_ELECT_TOKENS = 64
+
+
+class _BwdReduceCounter:
+    """Count `reduce_and_update_fp8_tensors(forward=False)` calls.
+
+    Wraps rather than replaces, so the real amax/scale update still runs and the
+    tests observe genuine delayed-scaling behaviour.
+    """
+
+    def __init__(self):
+        self.bwd = 0
+        self.fwd = 0
+
+    def reset(self):
+        self.bwd = 0
+        self.fwd = 0
+
+    def install(self, monkeypatch):
+        original = FP8GlobalStateManager.reduce_and_update_fp8_tensors
+        counter = self
+
+        def _counting(forward: bool = True):
+            if forward:
+                counter.fwd += 1
+            else:
+                counter.bwd += 1
+            original(forward=forward)
+
+        monkeypatch.setattr(
+            FP8GlobalStateManager,
+            "reduce_and_update_fp8_tensors",
+            staticmethod(_counting),
+        )
+
+
+class _ElectionRegion(torch.nn.Module):
+    """Three TE modules of three different classes, plus a recompute-phase probe.
+
+    Mixed class is deliberate: the restore lived in three separate call sites
+    (linear.py, layernorm_linear.py, layernorm_mlp.py), so a same-class region
+    would exercise only one of them.
+    """
+
+    def __init__(self, hidden=_ELECT_HIDDEN, grouped=False):
+        super().__init__()
+        self.first = LayerNormLinear(hidden, hidden, params_dtype=torch.float32, device="cuda")
+        if grouped:
+            self.middle = GroupedLinear(
+                2, hidden, hidden, params_dtype=torch.float32, device="cuda"
+            )
+        else:
+            self.middle = Linear(hidden, hidden, params_dtype=torch.float32, device="cuda")
+        self.last = LayerNormMLP(hidden, 4 * hidden, params_dtype=torch.float32, device="cuda")
+        self.grouped = grouped
+        self.forward_calls = 0
+        self.recompute_calls = 0
+
+    def reset_probes(self):
+        self.forward_calls = 0
+        self.recompute_calls = 0
+
+    def forward(self, x):
+        self.forward_calls += 1
+        if in_fp8_activation_recompute_phase():
+            self.recompute_calls += 1
+        x = self.first(x)
+        if self.grouped:
+            splits = [x.shape[0] // 2] * 2
+            x = self.middle(x, splits)
+        else:
+            x = self.middle(x)
+        return self.last(x)
+
+    def submodules(self):
+        return [self.first, self.middle, self.last]
+
+
+def _run_election_iters(regions, counter, quant_recipe, steps, use_reentrant, checkpointed=True):
+    """Run `steps` iterations; return per-iteration reduce counts and the probes."""
+    counts, fwd_calls, recompute_calls = [], [], []
+    for _ in range(steps):
+        for region in regions:
+            region.reset_probes()
+        counter.reset()
+        inp = torch.randn(
+            (_ELECT_TOKENS, _ELECT_HIDDEN), dtype=torch.float32, device="cuda", requires_grad=True
+        )
+        with autocast(enabled=True, recipe=quant_recipe):
+            out = inp
+            for region in regions:
+                if checkpointed:
+                    out = te_checkpoint(
+                        region,
+                        out,
+                        distribute_saved_activations=False,
+                        tp_group=None,
+                        use_reentrant=use_reentrant,
+                    )
+                else:
+                    out = region(out)
+        out.sum().backward()
+        torch.cuda.synchronize()
+        counts.append(counter.bwd)
+        fwd_calls.append([r.forward_calls for r in regions])
+        recompute_calls.append([r.recompute_calls for r in regions])
+    return counts, fwd_calls, recompute_calls
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("use_reentrant", all_boolean)
+def test_recompute_region_elects_one_bwd_amax_reduce(monkeypatch, use_reentrant):
+    """One backward amax reduce per recompute region, not one per module.
+
+    Detects: the election read being made non-consuming inside the recompute
+    phase, so every FP8 module in the region claims the backward amax all-reduce.
+    Fails before the fix: the region holds three modules, so the count is 3 rather
+    than 1 on every iteration. Only use_reentrant=True regressed -- on the
+    non-reentrant path the recompute's contexts are never backwarded, so the
+    context that fires comes from the first forward where the phase flag is False.
+    The False case is parametrised as a guard against a change that routes the
+    recompute contexts into backward.
+    Passes after the fix: the region's own autocast arms the flag once and the
+    first module consumes it.
+    Cannot pass for the wrong reason: the probes assert the region was genuinely
+    recomputed (forward runs twice, the second under
+    `in_fp8_activation_recompute_phase()`), so a count of 1 obtained because the
+    checkpoint degraded to a plain forward fails. The non-checkpointed reference
+    asserts these same three modules yield 1 with no checkpoint at all, so 1 is
+    not an artefact of the modules being unable to reduce. `counter.fwd` is
+    asserted non-zero, so a count of 1 cannot come from the patch not intercepting.
+    """
+    reset_rng_states()
+    FP8GlobalStateManager.reset()
+    quant_recipe = recipe.DelayedScaling()
+    counter = _BwdReduceCounter()
+    counter.install(monkeypatch)
+    steps = 3
+
+    region = _ElectionRegion()
+    counts, fwd_calls, recompute_calls = _run_election_iters(
+        [region], counter, quant_recipe, steps, use_reentrant
+    )
+
+    assert (
+        fwd_calls == [[2]] * steps
+    ), f"region was not recomputed once per iteration; forward counts {fwd_calls}"
+    assert (
+        recompute_calls == [[1]] * steps
+    ), f"region forward never ran under in_fp8_activation_recompute_phase(); got {recompute_calls}"
+    assert counter.fwd > 0, "reduce_and_update_fp8_tensors was never intercepted"
+
+    FP8GlobalStateManager.reset()
+    reference = _ElectionRegion()
+    ref_counts, ref_fwd, ref_recompute = _run_election_iters(
+        [reference], counter, quant_recipe, steps, use_reentrant, checkpointed=False
+    )
+    assert ref_fwd == [[1]] * steps and ref_recompute == [[0]] * steps
+    assert ref_counts == [1] * steps, (
+        "three uncheckpointed TE modules under one autocast must issue exactly one"
+        f" backward amax reduce per iteration, got {ref_counts}"
+    )
+
+    assert counts == [1] * steps, (
+        "expected exactly one backward FP8 amax reduce per recompute region per"
+        f" iteration, got {counts}. A count equal to the number of modules in the"
+        " region means every module claimed the reduce."
+    )
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("use_reentrant", all_boolean)
+def test_recompute_region_always_has_a_claimant(monkeypatch, use_reentrant):
+    """A recompute region must never elect zero modules.
+
+    This is the opposite failure and the one issue #1190 described: with no
+    claimant the backward amax is never reduced and `scaling_bwd.scale` stays
+    pinned at its initial value.
+
+    Detects: an over-correction that removes the claim from every module rather
+    than from all but one.
+    Fails before the fix: no -- this is a guard, not a reproducer. It is what stops
+    the test above from being satisfied by never claiming at all.
+    Cannot pass for the wrong reason: asserting only `count >= 1` would be
+    satisfiable by a claim that is made and then discarded, so the observable
+    consequence is asserted too -- the backward scale must leave its initial value,
+    compared against a clone taken after a warmup iteration.
+    """
+    reset_rng_states()
+    FP8GlobalStateManager.reset()
+    quant_recipe = recipe.DelayedScaling()
+    counter = _BwdReduceCounter()
+    counter.install(monkeypatch)
+    steps = 3
+
+    region = _ElectionRegion()
+    _run_election_iters([region], counter, quant_recipe, 1, use_reentrant)
+    initial = [m.fp8_meta["scaling_bwd"].scale.clone() for m in region.submodules()]
+
+    counts, _, _ = _run_election_iters([region], counter, quant_recipe, steps, use_reentrant)
+
+    assert all(c >= 1 for c in counts), (
+        f"a recompute region elected nobody to reduce the backward amax; counts {counts}."
+        " With zero claimants the backward scales are never updated (issue #1190)."
+    )
+    moved = [
+        not torch.equal(m.fp8_meta["scaling_bwd"].scale, ref)
+        for m, ref in zip(region.submodules(), initial)
+    ]
+    assert any(moved), (
+        f"no module's scaling_bwd.scale changed over {steps} iterations (moved={moved});"
+        " the reduce was claimed but its effect never landed"
+    )
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("num_regions", [2, 3])
+def test_bwd_amax_reduce_count_scales_with_regions(monkeypatch, num_regions):
+    """L sequential recompute regions issue L backward reduces -- not 1, not L*M.
+
+    This documents a KNOWN RESIDUAL. The fix elects one module per REGION, not one
+    per iteration: each region opens its own depth-0 autocast which re-arms the
+    election. Reducing that to one per iteration is a separate change.
+
+    Detects: a regression to per-module claiming (which gives L*M), and a future
+    change that collapses the per-region re-arm without analysis (which gives 1).
+    Fails before the fix: yes -- pre-fix this is L*3.
+    Cannot pass for the wrong reason: parametrised over two values of L with the
+    expected count equal to L, so a hardcoded or saturating count cannot satisfy
+    both; and the probes assert every region really was recomputed.
+    """
+    reset_rng_states()
+    FP8GlobalStateManager.reset()
+    quant_recipe = recipe.DelayedScaling()
+    counter = _BwdReduceCounter()
+    counter.install(monkeypatch)
+    steps = 3
+
+    regions = [_ElectionRegion() for _ in range(num_regions)]
+    counts, fwd_calls, recompute_calls = _run_election_iters(
+        regions, counter, quant_recipe, steps, use_reentrant=True
+    )
+
+    assert fwd_calls == [[2] * num_regions] * steps, f"not every region recomputed: {fwd_calls}"
+    assert recompute_calls == [[1] * num_regions] * steps, f"got {recompute_calls}"
+    assert counts == [num_regions] * steps, (
+        f"expected {num_regions} backward amax reduces per iteration, one per recompute"
+        f" region, got {counts}. 1 would mean the election is no longer re-armed per"
+        f" region; {num_regions * 3} would mean every module is claiming again."
+    )
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+def test_grouped_linear_region_matches_other_classes(monkeypatch):
+    """A region containing GroupedLinear elects one claimant, like every other class.
+
+    GroupedLinear never had the recompute restore -- it always consumed the
+    election. Pre-fix a region mixing it with restoring classes therefore produced
+    a count that depended on where it sat, matching neither the all-restoring
+    region nor the correct answer. It is placed second here for that reason; first,
+    it would have counted 1 even before the fix.
+
+    Cannot pass for the wrong reason: asserts equality against a separately
+    measured all-standard region as well as against 1, so a change breaking both
+    identically still fails the absolute check.
+    """
+    reset_rng_states()
+    FP8GlobalStateManager.reset()
+    quant_recipe = recipe.DelayedScaling()
+    counter = _BwdReduceCounter()
+    counter.install(monkeypatch)
+    steps = 3
+
+    grouped_counts, grouped_fwd, grouped_recompute = _run_election_iters(
+        [_ElectionRegion(grouped=True)], counter, quant_recipe, steps, use_reentrant=True
+    )
+    assert grouped_fwd == [[2]] * steps, f"grouped region not recomputed: {grouped_fwd}"
+    assert grouped_recompute == [[1]] * steps, f"got {grouped_recompute}"
+
+    FP8GlobalStateManager.reset()
+    standard_counts, _, _ = _run_election_iters(
+        [_ElectionRegion()], counter, quant_recipe, steps, use_reentrant=True
+    )
+
+    assert grouped_counts == [1] * steps, (
+        "a recompute region containing a GroupedLinear must issue exactly one backward"
+        f" amax reduce per iteration, got {grouped_counts}"
+    )
+    assert grouped_counts == standard_counts, (
+        f"GroupedLinear regions must behave like the other classes: {grouped_counts} vs"
+        f" {standard_counts}"
+    )
+
+
+def test_delayed_scaling_forbids_backward_override():
+    """Pins why the election guard also tests `backward_override`.
+
+    `backward_override` is recipe-global. The three electing modules consume the
+    one-shot election and then discard the claim when it is set, which -- once the
+    redundant claimants are gone -- would leave a region with no claimant. The fix
+    therefore folds it into the election guard rather than resetting afterwards.
+
+    DelayedScaling forbids the combination, so this is not reachable through the
+    built-in delayed recipe. It IS reachable through CustomRecipe, which permits
+    backward_override and can carry delayed-scaling state per slot. If this test
+    ever fails, DelayedScaling has gained backward_override support and a runtime
+    zero-claimant case belongs in `test_recompute_region_always_has_a_claimant`.
+    """
+    for override in ("high_precision", "dequantized"):
+        with pytest.raises(AssertionError, match="backward_override"):
+            recipe.DelayedScaling(backward_override=override)
