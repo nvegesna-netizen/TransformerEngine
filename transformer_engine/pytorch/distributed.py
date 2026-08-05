@@ -253,9 +253,13 @@ class activation_recompute_forward(AbstractContextManager, ContextDecorator):
         super().__init__()
         self.activation_recompute = activation_recompute
         self.recompute_phase = recompute_phase
+        # Stack, not a scalar: this is a ContextDecorator and instances are reused.
+        self._saved_states: List[Tuple[bool, bool]] = []
 
     def __enter__(self):
         global _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE
+        # Save the enclosing state so an inner region does not end the outer one.
+        self._saved_states.append((_IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE))
         # Track the checkpoint region independently of the FP8 state at entry.
         # A checkpointed callable may open its own FP8 autocast context (for
         # example, to select precision per layer). Delayed-scaling modules in
@@ -272,8 +276,12 @@ class activation_recompute_forward(AbstractContextManager, ContextDecorator):
 
     def __exit__(self, *exc_details):
         global _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE
-        _IN_ACTIVATION_RECOMPUTE_REGION = False
-        _ACTIVATION_RECOMPUTE_PHASE = False
+        # At depth 0 the saved state is (False, False), so this writes what the previous
+        # unconditional reset wrote. Fall back to that if the stack is empty rather than
+        # raising, since an unpaired exit used to be harmless.
+        _IN_ACTIVATION_RECOMPUTE_REGION, _ACTIVATION_RECOMPUTE_PHASE = (
+            self._saved_states.pop() if self._saved_states else (False, False)
+        )
 
 
 def is_fp8_activation_recompute_enabled() -> bool:
