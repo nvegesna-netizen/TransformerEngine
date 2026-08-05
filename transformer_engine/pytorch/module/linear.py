@@ -1434,14 +1434,18 @@ class _Linear(torch.autograd.Function):
             ctx.save_for_backward(*tensors_to_save)
             ctx.tensor_objects = tensor_objects
             ctx.backward_objects = bwd_args
-            if fwd_args.fp8 and (
-                fwd_args.input_requires_grad
-                or fwd_args.weight_requires_grad
-                or fwd_args.bias_requires_grad
+            # `is_first_fp8_module` is one-shot: electing here and then clearing the claim
+            # below consumed the token and left no later module able to claim it.
+            if (
+                fwd_args.fp8
+                and fwd_args.backward_override is None
+                and (
+                    fwd_args.input_requires_grad
+                    or fwd_args.weight_requires_grad
+                    or fwd_args.bias_requires_grad
+                )
             ):
                 bwd_args.reduce_and_update_bwd_fp8_tensors = _check_fp8_reduce_and_update()
-            if fwd_args.backward_override is not None:
-                bwd_args.reduce_and_update_bwd_fp8_tensors = False
 
         return out, new_weight_workspace
 

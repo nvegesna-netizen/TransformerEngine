@@ -589,7 +589,13 @@ class _LayerNormLinear(torch.autograd.Function):
             ctx.requires_dgrad = inp_requires_grad
             ctx.normalization = normalization
             ctx.reduce_and_update_bwd_fp8_tensors = False
-            if ctx.fp8 and requires_grad(inp, ln_weight, ln_bias, weight, bias):
+            # See linear.py: do not consume the one-shot election when the override
+            # block below is going to discard the claim.
+            if (
+                ctx.fp8
+                and backward_override is None
+                and requires_grad(inp, ln_weight, ln_bias, weight, bias)
+            ):
                 qstate = FP8GlobalStateManager.quantization_state
                 _first_fp8_module = qstate.is_first_fp8_module
                 ctx.reduce_and_update_bwd_fp8_tensors = FP8GlobalStateManager.is_first_fp8_module()
@@ -609,7 +615,6 @@ class _LayerNormLinear(torch.autograd.Function):
                 ctx.grad_input_quantizer = None
                 ctx.grad_weight_quantizer = None
                 ctx.grad_output_quantizer = None
-                ctx.reduce_and_update_bwd_fp8_tensors = False
 
         # ------------------------------------------------------
         # Cached state for backward pass is ready...

@@ -1342,7 +1342,9 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.inp_shape = inp.shape
             ctx.requires_dgrad = inp.requires_grad
             ctx.reduce_and_update_bwd_fp8_tensors = False
-            if ctx.fp8 and requires_grad(inp, weights[0], biases[0]):
+            # See linear.py: do not consume the one-shot election when the override
+            # block below is going to discard the claim.
+            if ctx.fp8 and backward_override is None and requires_grad(inp, weights[0], biases[0]):
                 ctx.reduce_and_update_bwd_fp8_tensors = (
                     ctx.reduce_and_update_bwd_fp8_tensors
                     or FP8GlobalStateManager.is_first_fp8_module()
@@ -1364,7 +1366,6 @@ class _GroupedLinear(torch.autograd.Function):
                 ctx.grad_input_quantizers = [None] * num_gemms
                 ctx.grad_weight_quantizers = [None] * num_gemms
                 ctx.grad_output_quantizers = [None] * num_gemms
-                ctx.reduce_and_update_bwd_fp8_tensors = False
 
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
         return out.view(-1, *inp.shape[1:-1], out.shape[-1]), new_workspaces
