@@ -256,13 +256,20 @@ class LinearBwdArgs:
 
 
 def _check_fp8_reduce_and_update():
-    """Check if this is the first FP8 module (for backward reduce-and-update)."""
-    qstate = FP8GlobalStateManager.quantization_state
-    _first_fp8_module = qstate.is_first_fp8_module
-    result = FP8GlobalStateManager.is_first_fp8_module()
-    if in_fp8_activation_recompute_phase():
-        qstate.is_first_fp8_module = _first_fp8_module
-    return result
+    """Check if this is the first FP8 module (for backward reduce-and-update).
+
+    The election is one-shot: `is_first_fp8_module` reads and clears. Both checkpoint
+    implementations wrap the recompute in their own autocast, entered after
+    `activation_recompute_forward`, which re-arms the flag at depth 0 and restores the
+    whole autocast state on exit -- so the region already scopes the election.
+
+    The elected module must have a backward node reachable from the loss. A checkpointed
+    callable whose first FP8 module feeds only a detached or otherwise dead branch elects
+    that module and its region then performs no reduce. `reduce_and_update_fp8_tensors`
+    sweeps the whole global buffer, so one healthy claimant anywhere in the backward
+    covers every module; this only bites if every region is shaped that way.
+    """
+    return FP8GlobalStateManager.is_first_fp8_module()
 
 
 def _linear_forward_impl(

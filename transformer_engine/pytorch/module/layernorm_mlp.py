@@ -58,7 +58,6 @@ from ..distributed import (
     reduce_scatter_along_first_dim,
     gather_along_first_dim,
     use_reentrant_activation_recompute,
-    in_fp8_activation_recompute_phase,
     _fsdp_scatter_tensors,
     _get_cuda_rng_state,
     _set_cuda_rng_state,
@@ -915,7 +914,11 @@ class _LayerNormMLP(torch.autograd.Function):
                 qstate = FP8GlobalStateManager.quantization_state
                 _first_fp8_module = qstate.is_first_fp8_module
                 ctx.reduce_and_update_bwd_fp8_tensors = FP8GlobalStateManager.is_first_fp8_module()
-                if in_fp8_activation_recompute_phase() or is_recomputation:
+                # `is_recomputation` is this module's OWN selective recompute. `_recompute`
+                # first restores the autocast state captured before any election, so this
+                # arm is what lets it reproduce the original decision instead of consuming
+                # a second time. Unrelated to activation-recompute regions.
+                if is_recomputation:
                     qstate.is_first_fp8_module = _first_fp8_module
 
             ctx.wgrad_store = wgrad_store
