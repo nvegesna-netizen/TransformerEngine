@@ -2573,6 +2573,9 @@ def test_delayed_scaling_forbids_backward_override():
     ever fails, DelayedScaling has gained backward_override support and a runtime
     zero-claimant case belongs in `test_recompute_region_always_has_a_claimant`.
     """
+    # DelayedScaling is a pydantic model, so the assertion surfaces as a
+    # ValidationError (a ValueError subclass) rather than a bare AssertionError.
+    # Both are accepted so this keeps working if that validation layer changes.
     for override in ("high_precision", "dequantized"):
-        with pytest.raises(AssertionError, match="backward_override"):
+        with pytest.raises((AssertionError, ValueError), match="backward_override"):
             recipe.DelayedScaling(backward_override=override)
