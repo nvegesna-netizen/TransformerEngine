@@ -153,6 +153,10 @@ class FlashAttentionUtils:
     # gated on opt-in (NVTE_FA3_SOFTCAP=1) and head_dim <= 256 in get_attention_backend. FA3 is
     # already restricted to Hopper (sm90) upstream, where its softcap fwd+bwd kernels are mature.
     fa3_supports_softcap = False
+    # True only if the installed FA4 build exposes a `softcap` parameter (signature probe in
+    # backends.py, fail-closed default False). Necessary-but-not-sufficient: FA4 softcap is also
+    # gated on opt-in (NVTE_FA4_SOFTCAP=1) and Blackwell (sm100+) in get_attention_backend.
+    fa4_supports_softcap = False
     v4_installation_steps = """\
 pip install flash-attn-4==4.0.0b11 nvidia-cutlass-dsl[cu13]"""
     v4_warning_printed = False
@@ -776,7 +780,7 @@ def get_attention_backend(
 
     # Filter: softcap
     # The scalar `softcap` kwarg (tanh logit softcapping) is plumbed to the FlashAttention 2
-    # backend (>= 2.6.0) by default, and to FA3 only behind an explicit opt-in gate below.
+    # backend (>= 2.6.0) by default, and to FA3/FA4 only behind explicit opt-in gates below.
     # FusedAttention/unfused don't take the scalar kwarg (cuDNN can softcap via score_mod, but that
     # path is not used here). Steer selection to FA2 rather than (a) hitting a runtime
     # NotImplementedError when an unwired backend is selected, or (b) silently dropping the cap.
@@ -791,22 +795,32 @@ def get_attention_backend(
             FlashAttentionUtils.fa3_supports_softcap
             and os.getenv("NVTE_FA3_SOFTCAP", "0") == "1"
             and max(head_dim_qk, head_dim_v) <= 256
-            and not context_parallel
         ):
-            # FA3 softcap is opt-in (NVTE_FA3_SOFTCAP=1) and requires a softcap-capable FA3 build,
-            # head_dim <= 256 (the range FA3's sm90 softcap kernels are instantiated for), and no
-            # context parallelism -- FA3's CP path hard-rejects nonzero softcap (backends.py), so
-            # selecting it here would just crash at dispatch instead of steering to FA2, which does
-            # support CP+softcap via context_parallel.py's autograd threading. FA3 is already
-            # Hopper-only upstream. FA3's non-CP softcap fwd+bwd is mature, so no arch/beta caveat is
-            # needed beyond the build probe; keep it opt-in to preserve FA2 as the default (unchanged
-            # behavior) and allow a clean FA2-vs-FA3 comparison. When all conditions hold, FA3
-            # survives and the softcap kwarg is threaded in backends.py.
+            # FA3 softcap is opt-in (NVTE_FA3_SOFTCAP=1) and requires a softcap-capable FA3 build and
+            # head_dim <= 256 (the range FA3's sm90 softcap kernels are instantiated for). FA3 is
+            # already Hopper-only upstream. Unlike FA4, FA3's softcap fwd+bwd is mature, so no arch/
+            # beta caveat is needed beyond the build probe; keep it opt-in to preserve FA2 as the
+            # default (unchanged behavior) and allow a clean FA2-vs-FA3 comparison. When all three
+            # hold, FA3 survives and the softcap kwarg is threaded in backends.py.
             logger.debug(
-                "Disabling FlashAttention 3 for softcap (requires softcap-capable FA3 build, "
-                "NVTE_FA3_SOFTCAP=1, head_dim <= 256, and no context parallelism)"
+                "Disabling FlashAttention 3 for softcap "
+                "(requires softcap-capable FA3 build, NVTE_FA3_SOFTCAP=1, and head_dim <= 256)"
             )
             use_flash_attention_3 = False
+        if use_flash_attention_4 and not (
+            FlashAttentionUtils.fa4_supports_softcap
+            and os.getenv("NVTE_FA4_SOFTCAP", "0") == "1"
+            and device_compute_capability >= (10, 0)
+        ):
+            # FA4 softcap is opt-in (NVTE_FA4_SOFTCAP=1), Blackwell-only for the initial enablement,
+            # and requires a softcap-capable FA4 build. A passing signature probe does not certify
+            # the beta backward, so keep it off by default; when all three hold, FA4 survives and the
+            # softcap kwarg is threaded in backends.py.
+            logger.debug(
+                "Disabling FlashAttention 4 for softcap "
+                "(requires softcap-capable FA4 build, NVTE_FA4_SOFTCAP=1, and Blackwell sm100+)"
+            )
+            use_flash_attention_4 = False
         if use_flash_attention_2 and not FlashAttentionUtils.v2_6_0_plus:
             logger.debug("Disabling FlashAttention 2 for softcap (requires flash-attn >= 2.6.0)")
             use_flash_attention_2 = False
