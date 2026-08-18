@@ -1088,6 +1088,70 @@ def test_nested_checkpoint_keeps_outer_fp8_recompute_region(use_reentrant):
 
 @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
 @pytest.mark.parametrize("use_reentrant", all_boolean)
+def test_nested_checkpoint_balances_fp8_recompute_stashes(use_reentrant):
+    """A nested checkpoint must produce exactly one stash/pop pair per module and step.
+
+    During an outer recompute, the inner checkpoint's forward is replayed before its own
+    recompute. If that replay is mistaken for a new phase-1 forward, each inner module
+    appends twice but pops once. The FIFO then grows every iteration and subsequent
+    recomputes restore scales from an older iteration.
+
+    Three iterations distinguish a balanced FIFO from a stable-looking first step. The
+    post-forward assertion proves delayed-scaling state was actually stashed, while the
+    call count proves the inner checkpoint was recomputed rather than bypassed. Without
+    the nested phase-inheritance/peek fix, end-of-step lengths grow instead of staying zero.
+    """
+    FP8GlobalStateManager.reset()
+    activation_recompute_forward._is_first_fp8_module.clear()
+    fp8_recipe = recipe.DelayedScaling(fp8_format=recipe.Format.HYBRID)
+    before = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    inner = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    after = Linear(16, 16, bias=False, params_dtype=torch.float32).cuda()
+    layers = (before, inner, after)
+    inner_calls = 0
+
+    def inner_body(value):
+        nonlocal inner_calls
+        inner_calls += 1
+        return inner(value)
+
+    def outer_body(value):
+        with autocast(enabled=True, recipe=fp8_recipe):
+            value = before(value)
+            value = te_checkpoint(inner_body, value, use_reentrant=use_reentrant)
+            return after(value)
+
+    try:
+        for iteration in range(3):
+            for layer in layers:
+                layer.zero_grad(set_to_none=True)
+            inp = torch.randn(16, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = te_checkpoint(outer_body, inp, use_reentrant=use_reentrant)
+                loss = out.float().sum()
+
+            buffer = FP8GlobalStateManager.quantization_state.fp8_tensors_recompute_buffer
+            assert len(buffer) == len(layers)
+            assert [len(stashes) for stashes in buffer] == [1] * len(layers)
+
+            calls_before_backward = inner_calls
+            loss.backward()
+            torch.cuda.synchronize()
+
+            assert inner_calls > calls_before_backward
+            assert [len(stashes) for stashes in buffer] == [0] * len(
+                layers
+            ), f"recompute stash leaked after iteration {iteration + 1}"
+            assert len(activation_recompute_forward._is_first_fp8_module) == 0
+            assert inp.grad is not None and torch.isfinite(inp.grad).all()
+            for layer in layers:
+                assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+    finally:
+        activation_recompute_forward._is_first_fp8_module.clear()
+
+
+@pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+@pytest.mark.parametrize("use_reentrant", all_boolean)
 @pytest.mark.parametrize("training", all_boolean)
 def test_checkpoint_with_eval_module_preserves_fp8_recompute_state(training, use_reentrant):
     """An eval module participating in autograd must stash just like a training module.
