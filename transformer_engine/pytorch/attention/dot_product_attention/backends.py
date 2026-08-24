@@ -169,7 +169,7 @@ else:
     # Probe whether this FA3 build exposes a `softcap` parameter on BOTH entry points. FA3's Hopper
     # (sm90) kernels DO implement tanh logit softcapping in fwd AND bwd (dedicated
     # flash_{fwd,bwd}_hdim256_bf16_softcap_sm90 instantiations, off only behind a compile-time
-    # DISABLE_SOFTCAP flag), so this is a mature path. Still fail-closed and additionally
+    # DISABLE_SOFTCAP flag), so unlike FA4 this is a mature path. Still fail-closed and additionally
     # gated on opt-in (NVTE_FA3_SOFTCAP) + head_dim <= 256 in get_attention_backend.
     try:
         fa_utils.fa3_supports_softcap = (
@@ -218,6 +218,17 @@ else:
         flash_attn_varlen_func_v4 = no_torch_dynamo()(_flash_attn_varlen_func_v4)
 
         fa_utils.v4_validate_head_dims = _fa4_validate_head_dims
+        # Probe whether this FA4 build exposes a `softcap` parameter on BOTH entry points. This proves
+        # the kwarg is accepted, NOT that the kernel applies it correctly in fwd+bwd — so FA4 softcap is
+        # additionally gated on opt-in (NVTE_FA4_SOFTCAP) + Blackwell in get_attention_backend, and must
+        # be validated by an in-container fwd+bwd parity test before production use. Fail-closed.
+        try:
+            fa_utils.fa4_supports_softcap = (
+                "softcap" in inspect.signature(flash_attn_func_v4).parameters
+                and "softcap" in inspect.signature(flash_attn_varlen_func_v4).parameters
+            )
+        except (ValueError, TypeError):
+            fa_utils.fa4_supports_softcap = False
         fa_utils.set_flash_attention_4_params()
 
 # Float8CurrentScaling: fused_attn_bwd takes O in FP8 by default, this flag allows it in F16
@@ -1206,10 +1217,21 @@ class FlashAttention(torch.nn.Module):
                         fa_optional_forward_args_thd.append(max_seqlen_q)
                         fa_optional_forward_args_thd.append(max_seqlen_kv)
                 if use_flash_attn_4:
+                    # Fail-loud net: the selection filter only keeps FA4 for softcap on a
+                    # softcap-capable build (opt-in + Blackwell). If FA4 is still reached with
+                    # softcap while the build lacks support (force-selected / regressed path),
+                    # raise rather than silently drop the cap.
+                    if softcap != 0.0 and not fa_utils.fa4_supports_softcap:
+                        raise NotImplementedError(
+                            "softcap is not supported by the installed FlashAttention 4 build. "
+                            "Please use FlashAttention 2 (>= 2.6.0) for softcap support."
+                        )
                     fa_4_optional_forward_kwargs = {
                         "window_size": window_size,
                         "num_splits": num_splits,
                     }
+                    if softcap != 0.0 and fa_utils.fa4_supports_softcap:
+                        fa_4_optional_forward_kwargs["softcap"] = softcap
                     if inference_params is None:
                         fa_4_optional_forward_kwargs["deterministic"] = self.deterministic
                     if func is flash_attn_varlen_func_v4:
