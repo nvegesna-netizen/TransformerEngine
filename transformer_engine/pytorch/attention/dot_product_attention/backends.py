@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from importlib.metadata import version as get_pkg_version
 from importlib.metadata import PackageNotFoundError
+import functools
 import inspect
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -181,6 +182,34 @@ else:
     except (ValueError, TypeError):
         fa_utils.fa3_supports_softcap = False
 
+def _fa4_normalized_window_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace the -1 unbounded window sentinel with the None FlashAttention 4 expects.
+
+    Benchmark-only copy of the fix in PR #3532. Without it FA4 returns an all-zero output for
+    causal attention on SM100, which cannot be benchmarked against anything.
+    """
+    window = kwargs.get("window_size")
+    if window is not None:
+        kwargs["window_size"] = tuple(
+            None if bound is not None and bound < 0 else bound for bound in window
+        )
+    for bound_name in ("window_size_left", "window_size_right"):
+        bound = kwargs.get(bound_name)
+        if bound is not None and bound < 0:
+            kwargs[bound_name] = None
+    return kwargs
+
+
+def _fa4_with_none_window_sentinel(func: Callable) -> Callable:
+    """Wrap an FA4 entry point so it never receives a negative window bound."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return func(*args, **_fa4_normalized_window_kwargs(kwargs))
+
+    return wrapper
+
+
 # Try to import Flash Attention v4
 try:
     fa_utils.fa4_version = PkgVersion(get_pkg_version("flash-attn-4"))
@@ -222,10 +251,12 @@ else:
     else:
         # Unlike versions 2 and 3, FlashAttention 4 registers no custom ops: it builds
         # its kernels through the CUTLASS DSL as it runs. Keep it an eager island.
-        flash_attn_func_v4 = no_torch_dynamo()(_flash_attn_func_v4)
-        flash_attn_varlen_func_v4 = no_torch_dynamo()(_flash_attn_varlen_func_v4)
-        _flash_attn_fwd_v4 = no_torch_dynamo()(_flash_attn_fwd_v4)
-        _flash_attn_bwd_v4 = no_torch_dynamo()(_flash_attn_bwd_v4)
+        flash_attn_func_v4 = no_torch_dynamo()(_fa4_with_none_window_sentinel(_flash_attn_func_v4))
+        flash_attn_varlen_func_v4 = no_torch_dynamo()(
+            _fa4_with_none_window_sentinel(_flash_attn_varlen_func_v4)
+        )
+        _flash_attn_fwd_v4 = no_torch_dynamo()(_fa4_with_none_window_sentinel(_flash_attn_fwd_v4))
+        _flash_attn_bwd_v4 = no_torch_dynamo()(_fa4_with_none_window_sentinel(_flash_attn_bwd_v4))
 
         fa_utils.v4_validate_head_dims = _fa4_validate_head_dims
         fa_utils.set_flash_attention_4_params()
